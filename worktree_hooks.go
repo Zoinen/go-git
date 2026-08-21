@@ -197,7 +197,10 @@ func (w *Worktree) HookPath(name HookName) (string, error) {
 // The hook order is pre-commit, prepare-commit-msg, commit-msg, then
 // post-commit. The first three hooks may reject the commit. post-commit runs
 // only after a commit was published; its error is returned with the published
-// hash because it cannot roll the commit back. Missing hooks are no-ops.
+// hash because it cannot roll the commit back. If cancellation races after
+// publication, post-commit still runs with a context that retains values but
+// is no longer cancelable, then the original cancellation error is returned.
+// Missing hooks are no-ops.
 //
 // prepare-commit-msg and commit-msg receive a temporary message file in the
 // Git directory when the worktree has a native OS path. A hook may edit that
@@ -247,17 +250,33 @@ func (w *Worktree) CommitWithHooksContext(ctx context.Context, msg string, opts 
 		return plumbing.ZeroHash, err
 	}
 
-	hash, err := w.CommitContext(ctx, msg, opts)
-	if err != nil {
-		return hash, err
+	hash, commitErr := w.CommitContext(ctx, msg, opts)
+	if commitErr != nil && !commitPublishedAfterCancellation(ctx, hash, commitErr) {
+		return hash, commitErr
 	}
 
 	postCommit := w.commitHookInvocation(HookPostCommit, layout, nil)
-	if err := runCommitHook(ctx, runner, postCommit); err != nil {
+	postContext := ctx
+	if commitErr != nil {
+		// A commit was already published. Preserve the expected post-commit
+		// side effect even if the caller happened to cancel at the same time.
+		postContext = context.WithoutCancel(ctx)
+	}
+	if err := runCommitHook(postContext, runner, postCommit); err != nil {
+		if commitErr != nil {
+			return hash, errors.Join(commitErr, err)
+		}
 		return hash, err
 	}
 
-	return hash, nil
+	return hash, commitErr
+}
+
+func commitPublishedAfterCancellation(ctx context.Context, hash plumbing.Hash, err error) bool {
+	if hash.IsZero() || ctx.Err() == nil {
+		return false
+	}
+	return errors.Is(err, ctx.Err())
 }
 
 func runCommitHook(ctx context.Context, runner HookRunner, invocation HookInvocation) error {

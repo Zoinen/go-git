@@ -113,6 +113,35 @@ func TestCommitWithHooksContext(t *testing.T) {
 		require.NoError(t, headErr)
 		assert.Equal(t, hash, head.Hash())
 	})
+
+	t.Run("published commit still runs post-commit after cancellation", func(t *testing.T) {
+		storage := &cancelAfterIndexWriteStorage{Storage: memory.NewStorage()}
+		repo, wt, fs := newContextOperationsWorktree(t, storage)
+		defer func() { _ = repo.Close() }()
+
+		require.NoError(t, util.WriteFile(fs, "file.txt", []byte("contents"), 0o644))
+		require.NoError(t, wt.StageContext(context.Background(), "file.txt"))
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		storage.cancel = cancel
+		storage.cancelOnReferenceWrite = true
+		var invocations []HookName
+		runner := HookRunnerFunc(func(_ context.Context, invocation HookInvocation) error {
+			invocations = append(invocations, invocation.Name)
+			return nil
+		})
+
+		hash, err := wt.CommitWithHooksContext(ctx, "commit", contextOperationsCommitOptions(), runner)
+		assert.False(t, hash.IsZero())
+		require.ErrorIs(t, err, context.Canceled)
+		assert.Equal(t, []HookName{
+			HookPreCommit,
+			HookPrepareCommitMessage,
+			HookCommitMessage,
+			HookPostCommit,
+		}, invocations)
+	})
 }
 
 func TestCommitWithHooksContextUsesEditedMessageFile(t *testing.T) {

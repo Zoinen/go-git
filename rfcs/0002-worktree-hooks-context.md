@@ -31,7 +31,9 @@ commit was published; if it fails, the method returns both the published hash
 and the hook error. Missing hooks are successful no-ops. Cancellation is
 checked before each hook and is passed to the runner. As with `CommitContext`,
 a cancellation racing after publication returns the created hash and the
-context error.
+context error. Because the commit is then durable, `post-commit` still runs
+with the context values but without its cancellation signal, before that error
+is returned.
 
 `HookRunner` receives a `HookInvocation` with an already-separated program
 path and argument vector. `OSHookRunner` starts that program with
