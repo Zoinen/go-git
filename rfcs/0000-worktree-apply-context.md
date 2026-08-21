@@ -17,16 +17,19 @@ patch editor.
 
 `ApplyContext` accepts the complete unified patch as `[]byte` and an optional
 `ApplyOptions`. With the zero options it updates regular text files in the
-worktree. With `Staged` it updates only the index. The non-context `Apply`
-method delegates to it with `context.Background()`.
+worktree. With `Staged` it updates only the index. With `Reverse` it applies
+the inverse of the patch, including file paths, modes, object fingerprints,
+and hunk additions and removals. The non-context `Apply` method delegates to
+it with `context.Background()`.
 
 The initial scope is intentionally narrow:
 
 - only regular text files and textual unified hunks are accepted;
 - `GIT binary patch`, NUL bytes, gitlinks, unresolved index entries, renames,
   copies, and mode-only changes return an explicit error;
-- if an `index OLD..NEW` header is present, `OLD` is a base fingerprint. It
-  must match the current source object before any mutation;
+- if an `index OLD..NEW` header is present, the source fingerprint (`OLD`, or
+  `NEW` for `Reverse`) must match the current source object before any
+  mutation;
 - every file and hunk is parsed and verified before publishing changes;
 - staged application builds one replacement index; worktree application first
   writes all replacement files, then renames them into place and restores

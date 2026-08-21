@@ -39,6 +39,11 @@ var (
 
 // ApplyOptions controls how a unified patch is applied.
 type ApplyOptions struct {
+	// Reverse applies the inverse of the patch, equivalent to git apply -R.
+	// The source and destination paths, modes, index object fingerprints, and
+	// hunk additions and removals are inverted before validation.
+	Reverse bool
+
 	// Staged applies the patch to the index and leaves the worktree unchanged.
 	// By default Apply updates the worktree and leaves the index unchanged.
 	Staged bool
@@ -49,7 +54,7 @@ type ApplyOptions struct {
 //
 // Apply rejects binary patches, gitlinks, unresolved index entries, renames,
 // copies, and file-mode-only changes. When a patch has an "index" header,
-// its old object ID is verified before any mutation. All hunks are verified
+// the source object ID is verified before any mutation. All hunks are verified
 // before publication.
 func (w *Worktree) Apply(patch []byte, opts *ApplyOptions) error {
 	return w.ApplyContext(context.Background(), patch, opts)
@@ -76,6 +81,14 @@ func (w *Worktree) ApplyContext(ctx context.Context, patch []byte, opts *ApplyOp
 	if len(files) == 0 {
 		return fmt.Errorf("%w: patch has no file changes", ErrApplyUnsupported)
 	}
+	if opts != nil && opts.Reverse {
+		for i := range files {
+			files[i].reverse()
+		}
+		if err := validateApplyFiles(files); err != nil {
+			return err
+		}
+	}
 
 	staged := opts != nil && opts.Staged
 	if staged {
@@ -90,6 +103,7 @@ type applyFile struct {
 	newPath string
 
 	oldObjectID string
+	newObjectID string
 	oldMode     filemode.FileMode
 	newMode     filemode.FileMode
 
@@ -126,6 +140,25 @@ type applyHunkLine struct {
 	kind      byte
 	text      string
 	noNewline bool
+}
+
+func (f *applyFile) reverse() {
+	f.oldPath, f.newPath = f.newPath, f.oldPath
+	f.oldObjectID, f.newObjectID = f.newObjectID, f.oldObjectID
+	f.oldMode, f.newMode = f.newMode, f.oldMode
+	for hunkIndex := range f.hunks {
+		hunk := &f.hunks[hunkIndex]
+		hunk.oldStart, hunk.newStart = hunk.newStart, hunk.oldStart
+		hunk.oldCount, hunk.newCount = hunk.newCount, hunk.oldCount
+		for lineIndex := range hunk.lines {
+			switch hunk.lines[lineIndex].kind {
+			case '+':
+				hunk.lines[lineIndex].kind = '-'
+			case '-':
+				hunk.lines[lineIndex].kind = '+'
+			}
+		}
+	}
 }
 
 func parseUnifiedPatch(ctx context.Context, patch []byte) ([]applyFile, error) {
@@ -228,11 +261,12 @@ func parseUnifiedPatch(ctx context.Context, patch []byte) ([]applyFile, error) {
 			}
 			current.oldMode = mode
 		case strings.HasPrefix(text, "index "):
-			oldID, err := parseOldObjectID(strings.TrimPrefix(text, "index "))
+			oldID, newID, err := parseObjectIDs(strings.TrimPrefix(text, "index "))
 			if err != nil {
 				return nil, fmt.Errorf("line %d: %w", lineNumber+1, err)
 			}
 			current.oldObjectID = oldID
+			current.newObjectID = newID
 		case strings.HasPrefix(text, "--- "):
 			filePath, err := parsePatchHeaderPath(strings.TrimPrefix(text, "--- "), "a/")
 			if err != nil {
@@ -267,23 +301,30 @@ func parseUnifiedPatch(ctx context.Context, patch []byte) ([]applyFile, error) {
 		return nil, err
 	}
 
+	if err := validateApplyFiles(files); err != nil {
+		return nil, err
+	}
+	return files, nil
+}
+
+func validateApplyFiles(files []applyFile) error {
 	seenPaths := make(map[string]struct{}, len(files))
 	for _, file := range files {
 		if err := validateApplyFile(file); err != nil {
-			return nil, err
+			return err
 		}
 		target := file.targetPath()
 		if _, ok := seenPaths[target]; ok {
-			return nil, fmt.Errorf("%w: patch changes %q more than once", ErrApplyUnsupported, target)
+			return fmt.Errorf("%w: patch changes %q more than once", ErrApplyUnsupported, target)
 		}
 		seenPaths[target] = struct{}{}
 		for other := range seenPaths {
 			if other != target && (strings.HasPrefix(other, target+"/") || strings.HasPrefix(target, other+"/")) {
-				return nil, fmt.Errorf("%w: patch changes both %q and %q", ErrApplyUnsupported, target, other)
+				return fmt.Errorf("%w: patch changes both %q and %q", ErrApplyUnsupported, target, other)
 			}
 		}
 	}
-	return files, nil
+	return nil
 }
 
 type patchTextLine struct {
@@ -398,19 +439,19 @@ func parseApplyMode(value string) (filemode.FileMode, error) {
 	return mode, nil
 }
 
-func parseOldObjectID(value string) (string, error) {
+func parseObjectIDs(value string) (string, string, error) {
 	fields := strings.Fields(value)
 	if len(fields) == 0 {
-		return "", fmt.Errorf("%w: malformed index header", ErrApplyUnsupported)
+		return "", "", fmt.Errorf("%w: malformed index header", ErrApplyUnsupported)
 	}
 	pair := strings.Split(fields[0], "..")
 	if len(pair) != 2 || pair[0] == "" || pair[1] == "" {
-		return "", fmt.Errorf("%w: malformed index object IDs", ErrApplyUnsupported)
+		return "", "", fmt.Errorf("%w: malformed index object IDs", ErrApplyUnsupported)
 	}
 	if !isObjectIDPrefix(pair[0]) || !isObjectIDPrefix(pair[1]) {
-		return "", fmt.Errorf("%w: invalid index object ID", ErrApplyUnsupported)
+		return "", "", fmt.Errorf("%w: invalid index object ID", ErrApplyUnsupported)
 	}
-	return pair[0], nil
+	return pair[0], pair[1], nil
 }
 
 func isObjectIDPrefix(value string) bool {

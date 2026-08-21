@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/go-git/go-git/v6/plumbing/filemode"
 	"github.com/go-git/go-git/v6/plumbing/format/index"
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/go-git/go-git/v6/storage/memory"
@@ -72,6 +73,109 @@ func TestApplyContextStaged(t *testing.T) {
 	contents, err := io.ReadAll(reader)
 	require.NoError(t, err)
 	assert.Equal(t, "one\nchanged\n", string(contents))
+}
+
+func TestApplyContextReverseWorktreeUsesNewBaseFingerprint(t *testing.T) {
+	repo, wt, filesystem := newApplyWorktree(t)
+	defer func() { _ = repo.Close() }()
+
+	const before = "one\ntwo\n"
+	const after = "one\nchanged\n"
+	require.NoError(t, util.WriteFile(filesystem, "file.txt", []byte(after), 0o644))
+	beforeHash, err := wt.hashBlob([]byte(before))
+	require.NoError(t, err)
+	afterHash, err := wt.hashBlob([]byte(after))
+	require.NoError(t, err)
+	patch := applyPatchWithObjectIDs("file.txt", beforeHash.String(), afterHash.String(), "@@ -1,2 +1,2 @@\n one\n-two\n+changed\n")
+
+	require.NoError(t, wt.ApplyContext(context.Background(), patch, &ApplyOptions{Reverse: true}))
+	contents, err := util.ReadFile(filesystem, "file.txt")
+	require.NoError(t, err)
+	assert.Equal(t, before, string(contents))
+}
+
+func TestApplyContextReverseStaged(t *testing.T) {
+	repo, wt, filesystem := newApplyWorktree(t)
+	defer func() { _ = repo.Close() }()
+
+	const before = "one\ntwo\n"
+	const after = "one\nchanged\n"
+	require.NoError(t, util.WriteFile(filesystem, "file.txt", []byte(before), 0o644))
+	_, err := wt.Add("file.txt")
+	require.NoError(t, err)
+	beforeHash, err := wt.hashBlob([]byte(before))
+	require.NoError(t, err)
+	afterHash, err := wt.hashBlob([]byte(after))
+	require.NoError(t, err)
+	patch := applyPatchWithObjectIDs("file.txt", beforeHash.String(), afterHash.String(), "@@ -1,2 +1,2 @@\n one\n-two\n+changed\n")
+
+	require.NoError(t, wt.ApplyContext(context.Background(), patch, &ApplyOptions{Staged: true}))
+	require.NoError(t, wt.ApplyContext(context.Background(), patch, &ApplyOptions{Staged: true, Reverse: true}))
+	idx, err := repo.Storer.Index()
+	require.NoError(t, err)
+	entry, err := idx.Entry("file.txt")
+	require.NoError(t, err)
+	assert.Equal(t, beforeHash, entry.Hash)
+	contents, err := util.ReadFile(filesystem, "file.txt")
+	require.NoError(t, err)
+	assert.Equal(t, before, string(contents))
+}
+
+func TestApplyContextReverseDeletesAFileCreatedByThePatch(t *testing.T) {
+	repo, wt, filesystem := newApplyWorktree(t)
+	defer func() { _ = repo.Close() }()
+
+	newHash, err := wt.hashBlob([]byte("new\n"))
+	require.NoError(t, err)
+	patch := []byte("diff --git a/new.txt b/new.txt\n" +
+		"new file mode 100644\n" +
+		"index 0000000000000000000000000000000000000000.." + newHash.String() + "\n" +
+		"--- /dev/null\n" +
+		"+++ b/new.txt\n" +
+		"@@ -0,0 +1 @@\n" +
+		"+new\n")
+	require.NoError(t, wt.ApplyContext(context.Background(), patch, nil))
+	require.NoError(t, wt.ApplyContext(context.Background(), patch, &ApplyOptions{Reverse: true}))
+	_, err = filesystem.Stat("new.txt")
+	assert.ErrorIs(t, err, os.ErrNotExist)
+}
+
+func TestApplyFileReverseInvertsAllPatchDirections(t *testing.T) {
+	file := applyFile{
+		oldPath:     "before.txt",
+		newPath:     "after.txt",
+		oldObjectID: "1111111",
+		newObjectID: "2222222",
+		oldMode:     filemode.Regular,
+		newMode:     filemode.Executable,
+		hunks: []applyHunk{{
+			oldStart: 2,
+			oldCount: 3,
+			newStart: 4,
+			newCount: 5,
+			lines: []applyHunkLine{
+				{kind: ' ', text: "context"},
+				{kind: '-', text: "removed", noNewline: true},
+				{kind: '+', text: "added"},
+			},
+		}},
+	}
+
+	file.reverse()
+	assert.Equal(t, "after.txt", file.oldPath)
+	assert.Equal(t, "before.txt", file.newPath)
+	assert.Equal(t, "2222222", file.oldObjectID)
+	assert.Equal(t, "1111111", file.newObjectID)
+	assert.Equal(t, filemode.Executable, file.oldMode)
+	assert.Equal(t, filemode.Regular, file.newMode)
+	assert.Equal(t, 4, file.hunks[0].oldStart)
+	assert.Equal(t, 5, file.hunks[0].oldCount)
+	assert.Equal(t, 2, file.hunks[0].newStart)
+	assert.Equal(t, 3, file.hunks[0].newCount)
+	assert.Equal(t, byte(' '), file.hunks[0].lines[0].kind)
+	assert.Equal(t, byte('+'), file.hunks[0].lines[1].kind)
+	assert.True(t, file.hunks[0].lines[1].noNewline)
+	assert.Equal(t, byte('-'), file.hunks[0].lines[2].kind)
 }
 
 func TestApplyContextPreCanceledDoesNotMutate(t *testing.T) {
@@ -278,6 +382,14 @@ func TestApplyContextMatchesGitApplyForTextPatch(t *testing.T) {
 	got, err := os.ReadFile(filepath.Join(goGitDirectory, "file.txt"))
 	require.NoError(t, err)
 	assert.Equal(t, want, got)
+
+	runGit(t, gitDirectory, "apply", "-R", "change.patch")
+	require.NoError(t, wt.ApplyContext(context.Background(), patch, &ApplyOptions{Reverse: true}))
+	want, err = os.ReadFile(filepath.Join(gitDirectory, "file.txt"))
+	require.NoError(t, err)
+	got, err = os.ReadFile(filepath.Join(goGitDirectory, "file.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, want, got)
 }
 
 func TestApplyContextStagedMatchesGitApplyCached(t *testing.T) {
@@ -293,8 +405,13 @@ func TestApplyContextStagedMatchesGitApplyCached(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(directory, "file.txt"), []byte("one\ntwo\n"), 0o644))
 		runGit(t, directory, "add", "file.txt")
 	}
-	base := strings.TrimSpace(runGitOutput(t, gitDirectory, "hash-object", "file.txt"))
-	patch := applyPatch("file.txt", base, "@@ -1,2 +1,2 @@\n one\n-two\n+changed\n")
+	patch := []byte("diff --git a/file.txt b/file.txt\n" +
+		"--- a/file.txt\n" +
+		"+++ b/file.txt\n" +
+		"@@ -1,2 +1,2 @@\n" +
+		" one\n" +
+		"-two\n" +
+		"+changed\n")
 	patchPath := filepath.Join(gitDirectory, "change.patch")
 	require.NoError(t, os.WriteFile(patchPath, patch, 0o644))
 	runGit(t, gitDirectory, "apply", "--cached", "change.patch")
@@ -312,6 +429,12 @@ func TestApplyContextStagedMatchesGitApplyCached(t *testing.T) {
 	worktreeContents, err := os.ReadFile(filepath.Join(goGitDirectory, "file.txt"))
 	require.NoError(t, err)
 	assert.Equal(t, "one\ntwo\n", string(worktreeContents))
+
+	runGit(t, gitDirectory, "apply", "-R", "--cached", "change.patch")
+	require.NoError(t, wt.ApplyContext(context.Background(), patch, &ApplyOptions{Staged: true, Reverse: true}))
+	want = runGitOutput(t, gitDirectory, "show", ":file.txt")
+	got = runGitOutput(t, goGitDirectory, "show", ":file.txt")
+	assert.Equal(t, want, got)
 }
 
 func newApplyWorktree(t *testing.T) (*Repository, *Worktree, billy.Filesystem) {
@@ -325,8 +448,12 @@ func newApplyWorktree(t *testing.T) (*Repository, *Worktree, billy.Filesystem) {
 }
 
 func applyPatch(name, oldHash, hunk string) []byte {
+	return applyPatchWithObjectIDs(name, oldHash, strings.Repeat("b", len(oldHash)), hunk)
+}
+
+func applyPatchWithObjectIDs(name, oldHash, newHash, hunk string) []byte {
 	return []byte("diff --git a/" + name + " b/" + name + "\n" +
-		"index " + oldHash + ".." + strings.Repeat("b", len(oldHash)) + " 100644\n" +
+		"index " + oldHash + ".." + newHash + " 100644\n" +
 		"--- a/" + name + "\n" +
 		"+++ b/" + name + "\n" + hunk)
 }
