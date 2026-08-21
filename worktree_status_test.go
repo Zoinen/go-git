@@ -1,6 +1,7 @@
 package git
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,10 +15,125 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/go-git/go-git/v6/config"
 	"github.com/go-git/go-git/v6/plumbing/cache"
+	"github.com/go-git/go-git/v6/plumbing/filemode"
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/go-git/go-git/v6/storage/filesystem"
 )
+
+func TestStatusContextReturnsCanceledContext(t *testing.T) {
+	t.Parallel()
+
+	repo, err := PlainInit(t.TempDir(), false)
+	require.NoError(t, err)
+	defer func() { _ = repo.Close() }()
+
+	wt, err := repo.Worktree()
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err = wt.StatusContext(ctx, StatusOptions{})
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestStatusContextIncludesIgnoredPathsOnlyWhenRequested(t *testing.T) {
+	t.Parallel()
+
+	repo, err := PlainInit(t.TempDir(), false)
+	require.NoError(t, err)
+	defer func() { _ = repo.Close() }()
+
+	wt, err := repo.Worktree()
+	require.NoError(t, err)
+
+	require.NoError(t, util.WriteFile(wt.Filesystem(), ".gitignore", []byte("ignored.txt\n"), 0o644))
+	_, err = wt.Add(".gitignore")
+	require.NoError(t, err)
+	_, err = wt.Commit("add ignore rule", &CommitOptions{Author: defaultSignature()})
+	require.NoError(t, err)
+
+	require.NoError(t, util.WriteFile(wt.Filesystem(), "ignored.txt", []byte("ignored\n"), 0o644))
+	require.NoError(t, util.WriteFile(wt.Filesystem(), "visible.txt", []byte("visible\n"), 0o644))
+
+	withoutIgnored, err := wt.StatusContext(context.Background(), StatusOptions{})
+	require.NoError(t, err)
+	assert.NotContains(t, withoutIgnored, "ignored.txt")
+	assert.Equal(t, &FileStatus{Staging: Untracked, Worktree: Untracked}, withoutIgnored["visible.txt"])
+
+	withIgnored, err := wt.StatusContext(context.Background(), StatusOptions{IncludeIgnored: true})
+	require.NoError(t, err)
+	assert.Equal(t, &FileStatus{Staging: Ignored, Worktree: Ignored}, withIgnored["ignored.txt"])
+	assert.Equal(t, &FileStatus{Staging: Untracked, Worktree: Untracked}, withIgnored["visible.txt"])
+	ignoredOnly := Status{"ignored.txt": withIgnored["ignored.txt"]}
+	assert.Equal(t, "!! ignored.txt\n", ignoredOnly.String())
+	assert.True(t, ignoredOnly.IsClean())
+
+	if git, err := exec.LookPath("git"); err == nil {
+		output, err := exec.Command(git, "-C", wt.Filesystem().Root(), "status", "--porcelain=v1", "--ignored", "--untracked-files=all").Output()
+		require.NoError(t, err)
+		assert.Equal(t, "?? visible.txt\n!! ignored.txt\n", string(output))
+	}
+}
+
+func TestStatusContextRecursesIntoInitializedSubmodules(t *testing.T) {
+	t.Parallel()
+
+	parent, err := PlainInit(t.TempDir(), false)
+	require.NoError(t, err)
+	defer func() { _ = parent.Close() }()
+
+	parentWT, err := parent.Worktree()
+	require.NoError(t, err)
+	require.NoError(t, parentWT.Filesystem().MkdirAll("sub", 0o755))
+
+	moduleStore, err := parent.Storer.Module("sub")
+	require.NoError(t, err)
+	subFS, err := parentWT.Filesystem().Chroot("sub")
+	require.NoError(t, err)
+	sub, err := Init(moduleStore, WithWorkTree(subFS))
+	require.NoError(t, err)
+
+	subWT, err := sub.Worktree()
+	require.NoError(t, err)
+	require.NoError(t, util.WriteFile(subWT.Filesystem(), "tracked.txt", []byte("before\n"), 0o644))
+	_, err = subWT.Add("tracked.txt")
+	require.NoError(t, err)
+	subHead, err := subWT.Commit("initial", &CommitOptions{Author: defaultSignature()})
+	require.NoError(t, err)
+	require.NoError(t, sub.Close())
+
+	require.NoError(t, util.WriteFile(parentWT.Filesystem(), ".gitmodules", []byte("[submodule \"sub\"]\n\tpath = sub\n\turl = https://example.com/sub.git\n"), 0o644))
+	_, err = parentWT.Add(".gitmodules")
+	require.NoError(t, err)
+
+	idx, err := parent.Storer.Index()
+	require.NoError(t, err)
+	entry, err := idx.Add("sub")
+	require.NoError(t, err)
+	entry.Hash = subHead
+	entry.Mode = filemode.Submodule
+	require.NoError(t, parent.Storer.SetIndex(idx))
+
+	cfg, err := parent.Config()
+	require.NoError(t, err)
+	cfg.Submodules["sub"] = &config.Submodule{Name: "sub", Path: "sub", URL: "https://example.com/sub.git"}
+	require.NoError(t, parent.Storer.SetConfig(cfg))
+
+	_, err = parentWT.Commit("add submodule", &CommitOptions{Author: defaultSignature()})
+	require.NoError(t, err)
+	require.NoError(t, util.WriteFile(subFS, "tracked.txt", []byte("after\n"), 0o644))
+
+	withoutRecursion, err := parentWT.StatusContext(context.Background(), StatusOptions{})
+	require.NoError(t, err)
+	assert.NotContains(t, withoutRecursion, "sub")
+
+	withRecursion, err := parentWT.StatusContext(context.Background(), StatusOptions{RecursiveSubmodules: true})
+	require.NoError(t, err)
+	assert.Equal(t, &FileStatus{Staging: Unmodified, Worktree: Modified}, withRecursion["sub"])
+}
 
 // For additional context: #1159.
 func TestIndexEntrySizeUpdatedForNonRegularFiles(t *testing.T) {

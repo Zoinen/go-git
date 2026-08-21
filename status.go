@@ -2,6 +2,7 @@ package git
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"path/filepath"
 
@@ -32,6 +33,10 @@ func (s Status) IsUntracked(path string) bool {
 // IsClean returns true if all the files are in Unmodified status.
 func (s Status) IsClean() bool {
 	for _, status := range s {
+		if status.Staging == Ignored && status.Worktree == Ignored {
+			continue
+		}
+
 		if status.Worktree != Unmodified || status.Staging != Unmodified {
 			return false
 		}
@@ -80,6 +85,7 @@ const (
 	Renamed            StatusCode = 'R'
 	Copied             StatusCode = 'C'
 	UpdatedButUnmerged StatusCode = 'U'
+	Ignored            StatusCode = '!'
 )
 
 // StatusStrategy defines the different types of strategies when processing
@@ -109,17 +115,21 @@ const (
 	Preload StatusStrategy = 1
 )
 
-func (s StatusStrategy) new(w *Worktree) (Status, error) {
+func (s StatusStrategy) newContext(ctx context.Context, w *Worktree) (Status, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	switch s {
 	case Preload:
-		return preloadStatus(w)
+		return preloadStatusContext(ctx, w)
 	case Empty:
 		return make(Status), nil
 	}
 	return nil, fmt.Errorf("%w: %+v", ErrUnsupportedStatusStrategy, s)
 }
 
-func preloadStatus(w *Worktree) (Status, error) {
+func preloadStatusContext(ctx context.Context, w *Worktree) (Status, error) {
 	idx, err := w.r.Storer.Index()
 	if err != nil {
 		return nil, err
@@ -137,6 +147,10 @@ func preloadStatus(w *Worktree) (Status, error) {
 
 	status := make(Status)
 	for len(nodes) > 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		var node noder.Noder
 		node, nodes = nodes[0], nodes[1:]
 		if node.IsDir() {

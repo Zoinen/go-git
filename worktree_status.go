@@ -2,6 +2,7 @@ package git
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -43,16 +44,44 @@ var (
 
 // Status returns the working tree status.
 func (w *Worktree) Status() (Status, error) {
-	return w.StatusWithOptions(StatusOptions{Strategy: defaultStatusStrategy})
+	return w.StatusContext(context.Background(), StatusOptions{Strategy: defaultStatusStrategy})
 }
 
-// StatusOptions defines the options for Worktree.StatusWithOptions().
+// StatusOptions defines the options for Worktree.StatusWithOptions and
+// Worktree.StatusContext.
 type StatusOptions struct {
 	Strategy StatusStrategy
+
+	// IncludeIgnored includes ignored, untracked paths in the returned status.
+	// Ignored paths are reported with both Staging and Worktree set to Ignored.
+	// They do not make Status.IsClean return false.
+	IncludeIgnored bool
+
+	// RecursiveSubmodules reports changes within initialized submodules as a
+	// modification of the containing gitlink. It does not add the submodule's
+	// individual paths to the returned status.
+	RecursiveSubmodules bool
 }
 
 // StatusWithOptions returns the working tree status.
 func (w *Worktree) StatusWithOptions(o StatusOptions) (Status, error) {
+	return w.StatusContext(context.Background(), o)
+}
+
+// StatusContext returns the working tree status. It is equivalent to
+// StatusWithOptions, but stops between filesystem and object-store operations
+// when ctx is canceled.
+//
+// A nil context is treated as context.Background.
+func (w *Worktree) StatusContext(ctx context.Context, o StatusOptions) (Status, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	var hash plumbing.Hash
 
 	ref, err := w.r.Head()
@@ -63,27 +92,37 @@ func (w *Worktree) StatusWithOptions(o StatusOptions) (Status, error) {
 	if err == nil {
 		hash = ref.Hash()
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	cfg, err := w.r.Config()
 	if err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
-	return w.status(cfg, o.Strategy, hash)
+	return w.statusContext(ctx, cfg, o, hash)
 }
 
-func (w *Worktree) status(cfg *config.Config, ss StatusStrategy, commit plumbing.Hash) (Status, error) {
-	s, err := ss.new(w)
+func (w *Worktree) statusContext(ctx context.Context, cfg *config.Config, o StatusOptions, commit plumbing.Hash) (Status, error) {
+	s, err := o.Strategy.newContext(ctx, w)
 	if err != nil {
 		return nil, err
 	}
 
-	left, err := w.diffCommitWithStaging(commit, false)
+	left, err := w.diffCommitWithStagingContext(ctx, commit, false)
 	if err != nil {
 		return nil, err
 	}
 
 	for _, ch := range left {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		a, err := ch.Action()
 		if err != nil {
 			return nil, err
@@ -102,12 +141,21 @@ func (w *Worktree) status(cfg *config.Config, ss StatusStrategy, commit plumbing
 		}
 	}
 
-	right, err := w.diffStagingWithWorktree(cfg, false, true)
+	var ignored *statusIgnoreMatcher
+	if o.IncludeIgnored {
+		ignored = newStatusIgnoreMatcher(w)
+	}
+
+	right, err := w.diffStagingWithWorktreeContext(ctx, cfg, false, !o.IncludeIgnored, o.RecursiveSubmodules)
 	if err != nil {
 		return nil, err
 	}
 
 	for _, ch := range right {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		a, err := ch.Action()
 		if err != nil {
 			return nil, err
@@ -124,6 +172,17 @@ func (w *Worktree) status(cfg *config.Config, ss StatusStrategy, commit plumbing
 		case merkletrie.Insert:
 			fs.Worktree = Untracked
 			fs.Staging = Untracked
+
+			if ignored != nil {
+				isIgnored, err := ignored.Match(ctx, ch.To.String())
+				if err != nil {
+					return nil, err
+				}
+				if isIgnored {
+					fs.Worktree = Ignored
+					fs.Staging = Ignored
+				}
+			}
 		case merkletrie.Modify:
 			fs.Worktree = Modified
 		}
@@ -142,15 +201,30 @@ func nameFromAction(ch *merkletrie.Change) string {
 }
 
 func (w *Worktree) diffStagingWithWorktree(cfg *config.Config, reverse, excludeIgnoredChanges bool) (merkletrie.Changes, error) {
+	return w.diffStagingWithWorktreeContext(context.Background(), cfg, reverse, excludeIgnoredChanges, false)
+}
+
+func (w *Worktree) diffStagingWithWorktreeContext(
+	ctx context.Context,
+	cfg *config.Config,
+	reverse, excludeIgnoredChanges, recursiveSubmodules bool,
+) (merkletrie.Changes, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	idx, err := w.r.Storer.Index()
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
 	from := mindex.NewRootNodeWithOptions(idx, mindex.RootNodeOptions{
 		UpholdExecutableBit: cfg.Core.FileMode,
 	})
-	submodules, err := w.getSubmodulesStatus(cfg)
+	submodules, err := w.getSubmodulesStatusContext(ctx, cfg, recursiveSubmodules)
 	if err != nil {
 		return nil, err
 	}
@@ -179,9 +253,9 @@ func (w *Worktree) diffStagingWithWorktree(cfg *config.Config, reverse, excludeI
 	to := filesystem.NewRootNodeWithOptions(w.filesystem, submodules, fsOpts)
 
 	if reverse {
-		return merkletrie.DiffTree(to, from, diffTreeIsEquals)
+		return w.diffTreeContext(ctx, to, from)
 	}
-	return merkletrie.DiffTree(from, to, diffTreeIsEquals)
+	return w.diffTreeContext(ctx, from, to)
 }
 
 // ignoreScope builds the ignore scope in effect at the root of the worktree:
@@ -207,7 +281,68 @@ func (w *Worktree) ignoreScope() *gitignore.Scope {
 	return gitignore.NewScope(patterns)
 }
 
-func (w *Worktree) getSubmodulesStatus(cfg *config.Config) (map[string]plumbing.Hash, error) {
+// statusIgnoreMatcher evaluates ignore rules for paths returned by a status
+// walk that intentionally includes ignored entries. Scopes are cached by
+// directory so that sibling paths do not re-read the same .gitignore files.
+type statusIgnoreMatcher struct {
+	fs     *Worktree
+	scopes map[string]*gitignore.Scope
+}
+
+func newStatusIgnoreMatcher(w *Worktree) *statusIgnoreMatcher {
+	return &statusIgnoreMatcher{
+		fs:     w,
+		scopes: map[string]*gitignore.Scope{"": w.ignoreScope()},
+	}
+}
+
+func (m *statusIgnoreMatcher) Match(ctx context.Context, filename string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
+	filename = filepath.ToSlash(filepath.Clean(filename))
+	if filename == "." || filename == "" {
+		return false, nil
+	}
+
+	info, err := m.fs.filesystem.Lstat(filename)
+	if err != nil {
+		return false, err
+	}
+
+	parts := strings.Split(filename, "/")
+	scope := m.scopes[""]
+	for i := range parts[:len(parts)-1] {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+
+		dir := strings.Join(parts[:i+1], "/")
+		if cached, ok := m.scopes[dir]; ok {
+			scope = cached
+			continue
+		}
+
+		parent := scope
+		var descendErr error
+		scope, descendErr = parent.Descend(parts[:i+1], func() ([]gitignore.Pattern, error) {
+			return gitignore.DirPatterns(m.fs.filesystem, parts[:i+1])
+		})
+		if descendErr != nil {
+			return false, descendErr
+		}
+		m.scopes[dir] = scope
+	}
+
+	return scope.Match(parts, info.IsDir()), nil
+}
+
+func (w *Worktree) getSubmodulesStatusContext(
+	ctx context.Context,
+	cfg *config.Config,
+	recursive bool,
+) (map[string]plumbing.Hash, error) {
 	o := map[string]plumbing.Hash{}
 
 	sub, err := w.submodulesWithConfig(cfg)
@@ -215,28 +350,69 @@ func (w *Worktree) getSubmodulesStatus(cfg *config.Config) (map[string]plumbing.
 		return nil, err
 	}
 
-	status, err := sub.Status()
-	if err != nil {
-		return nil, err
-	}
+	for _, module := range sub {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 
-	for _, s := range status {
+		s, err := module.Status()
+		if err != nil {
+			return nil, err
+		}
+
 		if s.Current.IsZero() {
 			o[s.Path] = s.Expected
 			continue
 		}
 
 		o[s.Path] = s.Current
+		if !recursive || !s.IsClean() || !module.initialized {
+			continue
+		}
+
+		r, err := module.Repository()
+		if err != nil {
+			return nil, err
+		}
+
+		wt, err := r.Worktree()
+		if err == nil {
+			var nested Status
+			nested, err = wt.StatusContext(ctx, StatusOptions{
+				Strategy:            defaultStatusStrategy,
+				RecursiveSubmodules: true,
+			})
+			if err == nil && !nested.IsClean() {
+				// A gitlink hashes the submodule's HEAD, so a dirty worktree at
+				// that same HEAD needs a distinct synthetic value to make the
+				// parent diff report it as modified.
+				o[s.Path] = plumbing.ZeroHash
+			}
+		}
+		closeErr := r.Close()
+		if err != nil {
+			return nil, err
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
 	}
 
 	return o, nil
 }
 
-func (w *Worktree) diffCommitWithStaging(commit plumbing.Hash, reverse bool) (merkletrie.Changes, error) {
+func (w *Worktree) diffCommitWithStagingContext(ctx context.Context, commit plumbing.Hash, reverse bool) (merkletrie.Changes, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	var t *object.Tree
 	if !commit.IsZero() {
 		c, err := w.r.CommitObject(commit)
 		if err != nil {
+			return nil, err
+		}
+		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 
@@ -244,12 +420,23 @@ func (w *Worktree) diffCommitWithStaging(commit plumbing.Hash, reverse bool) (me
 		if err != nil {
 			return nil, err
 		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 	}
 
-	return w.diffTreeWithStaging(t, reverse)
+	return w.diffTreeWithStagingContext(ctx, t, reverse)
 }
 
 func (w *Worktree) diffTreeWithStaging(t *object.Tree, reverse bool) (merkletrie.Changes, error) {
+	return w.diffTreeWithStagingContext(context.Background(), t, reverse)
+}
+
+func (w *Worktree) diffTreeWithStagingContext(ctx context.Context, t *object.Tree, reverse bool) (merkletrie.Changes, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	var from noder.Noder
 	if t != nil {
 		from = object.NewTreeRootNode(t)
@@ -259,14 +446,27 @@ func (w *Worktree) diffTreeWithStaging(t *object.Tree, reverse bool) (merkletrie
 	if err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	to := mindex.NewRootNode(idx)
 
 	if reverse {
-		return merkletrie.DiffTree(to, from, diffTreeIsEquals)
+		return w.diffTreeContext(ctx, to, from)
 	}
 
-	return merkletrie.DiffTree(from, to, diffTreeIsEquals)
+	return w.diffTreeContext(ctx, from, to)
+}
+
+func (w *Worktree) diffTreeContext(ctx context.Context, from, to noder.Noder) (merkletrie.Changes, error) {
+	changes, err := merkletrie.DiffTreeContext(ctx, from, to, diffTreeIsEquals)
+	if err != nil && errors.Is(err, merkletrie.ErrCanceled) {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, contextErr
+		}
+	}
+	return changes, err
 }
 
 // diffTrees returns the changes between two tree objects.
