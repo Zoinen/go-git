@@ -151,7 +151,7 @@ func TestDiffContextRejectsUnsafePathFilters(t *testing.T) {
 	t.Parallel()
 
 	wt := newDiffTestWorktree(t)
-	_, err := wt.DiffContext(context.Background(), DiffOptions{Paths: []string{"../outside"}})
+	_, err := wt.DiffContext(context.Background(), DiffOptions{Paths: []string{".", "../outside"}})
 	require.Error(t, err)
 	assert.True(t, strings.Contains(err.Error(), "invalid diff path"))
 }

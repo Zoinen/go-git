@@ -86,12 +86,21 @@ func (w *Worktree) DiffContext(ctx context.Context, o DiffOptions) (string, erro
 	if err != nil {
 		return "", err
 	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	idx, err := w.r.Storer.Index()
 	if err != nil {
 		return "", err
 	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	head, err := w.headTree()
 	if err != nil {
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
 		return "", err
 	}
 
@@ -159,15 +168,20 @@ func (w *Worktree) DiffContext(ctx context.Context, o DiffOptions) (string, erro
 
 func diffPathFilters(paths []string) ([]string, error) {
 	filters := make([]string, 0, len(paths))
+	all := false
 	for _, name := range paths {
 		name = filepath.ToSlash(filepath.Clean(name))
 		if name == "." {
-			return nil, nil
+			all = true
+			continue
 		}
 		if err := pathutil.ValidTreePath(name); err != nil {
 			return nil, fmt.Errorf("invalid diff path %q: %w", name, err)
 		}
 		filters = append(filters, name)
+	}
+	if all {
+		return nil, nil
 	}
 	return filters, nil
 }
@@ -378,9 +392,14 @@ func diffBlobHash(s storer.EncodedObjectStorer, data []byte) (plumbing.Hash, err
 	if err != nil {
 		return plumbing.ZeroHash, err
 	}
-	if _, err := writer.Write(data); err != nil {
+	n, err := writer.Write(data)
+	if err != nil {
 		_ = writer.Close()
 		return plumbing.ZeroHash, err
+	}
+	if n != len(data) {
+		_ = writer.Close()
+		return plumbing.ZeroHash, io.ErrShortWrite
 	}
 	if err := writer.Close(); err != nil {
 		return plumbing.ZeroHash, err
